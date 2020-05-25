@@ -204,7 +204,6 @@ typedef struct {
 	 * before the interrupt is cleared. */
 	unsigned int interrupt_high_delay;
 
-	bool need_strict_step;
 	bool never_halted;
 } riscv011_info_t;
 
@@ -240,6 +239,7 @@ static unsigned int slot_offset(const struct target *target, slot_t slot)
 				case SLOT1: return 5;
 				case SLOT_LAST: return info->dramsize-1;
 			}
+			break;
 		case 64:
 			switch (slot) {
 				case SLOT0: return 4;
@@ -357,6 +357,15 @@ static void add_dbus_scan(const struct target *target, struct scan_field *field,
 		uint16_t address, uint64_t data)
 {
 	riscv011_info_t *info = get_info(target);
+	RISCV_INFO(r);
+
+	if (r->reset_delays_wait >= 0) {
+		r->reset_delays_wait--;
+		if (r->reset_delays_wait < 0) {
+			info->dbus_busy_delay = 0;
+			info->interrupt_high_delay = 0;
+		}
+	}
 
 	field->num_bits = info->addrbits + DBUS_OP_SIZE + DBUS_DATA_SIZE;
 	field->in_value = in_value;
@@ -455,12 +464,12 @@ static uint64_t dbus_read(struct target *target, uint16_t address)
 	uint64_t value;
 	dbus_status_t status;
 	uint16_t address_in;
-	
+
 	/* If the previous read/write was to the same address, we will get the read data
 	 * from the previous access.
 	 * While somewhat nonintuitive, this is an efficient way to get the data.
 	 */
-	
+
 	unsigned i = 0;
 	do {
 		status = dbus_scan(target, &address_in, &value, DBUS_OP_READ, address, 0);
@@ -680,7 +689,7 @@ static bits_t read_bits(struct target *target)
 				}
 				increase_dbus_busy_delay(target);
 			} else if (status == DBUS_STATUS_FAILED) {
-				// TODO: return an actual error
+				/* TODO: return an actual error */
 				return err_result;
 			}
 		} while (status == DBUS_STATUS_BUSY && i++ < 256);
@@ -1105,7 +1114,10 @@ static int execute_resume(struct target *target, bool step)
 		}
 	}
 
-	info->dcsr |= DCSR_EBREAKM | DCSR_EBREAKH | DCSR_EBREAKS | DCSR_EBREAKU;
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKM, riscv_ebreakm);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKS, riscv_ebreaks);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKU, riscv_ebreaku);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKH, 1);
 	info->dcsr &= ~DCSR_HALT;
 
 	if (step)
@@ -1403,15 +1415,7 @@ static void deinit_target(struct target *target)
 
 static int strict_step(struct target *target, bool announce)
 {
-	riscv011_info_t *info = get_info(target);
-
 	LOG_DEBUG("enter");
-
-	struct breakpoint *breakpoint = target->breakpoints;
-	while (breakpoint) {
-		riscv_remove_breakpoint(target, breakpoint);
-		breakpoint = breakpoint->next;
-	}
 
 	struct watchpoint *watchpoint = target->watchpoints;
 	while (watchpoint) {
@@ -1423,19 +1427,11 @@ static int strict_step(struct target *target, bool announce)
 	if (result != ERROR_OK)
 		return result;
 
-	breakpoint = target->breakpoints;
-	while (breakpoint) {
-		riscv_add_breakpoint(target, breakpoint);
-		breakpoint = breakpoint->next;
-	}
-
 	watchpoint = target->watchpoints;
 	while (watchpoint) {
 		riscv_add_watchpoint(target, watchpoint);
 		watchpoint = watchpoint->next;
 	}
-
-	info->need_strict_step = false;
 
 	return ERROR_OK;
 }
@@ -1443,8 +1439,6 @@ static int strict_step(struct target *target, bool announce)
 static int step(struct target *target, int current, target_addr_t address,
 		int handle_breakpoints)
 {
-	riscv011_info_t *info = get_info(target);
-
 	jtag_add_ir_scan(target->tap, &select_dbus, TAP_IDLE);
 
 	if (!current) {
@@ -1457,12 +1451,12 @@ static int step(struct target *target, int current, target_addr_t address,
 			return result;
 	}
 
-	if (info->need_strict_step || handle_breakpoints) {
+	if (handle_breakpoints) {
 		int result = strict_step(target, true);
 		if (result != ERROR_OK)
 			return result;
 	} else {
-		return resume(target, 0, true);
+		return full_step(target, false);
 	}
 
 	return ERROR_OK;
@@ -1488,7 +1482,6 @@ static int examine(struct target *target)
 	}
 
 	RISCV_INFO(r);
-	r->hart_count = 1;
 
 	riscv011_info_t *info = get_info(target);
 	info->addrbits = get_field(dtmcontrol, DTMCONTROL_ADDRBITS);
@@ -1572,11 +1565,11 @@ static int examine(struct target *target)
 	}
 	LOG_DEBUG("Discovered XLEN is %d", riscv_xlen(target));
 
-	if (read_csr(target, &r->misa, CSR_MISA) != ERROR_OK) {
+	if (read_csr(target, &r->misa[0], CSR_MISA) != ERROR_OK) {
 		const unsigned old_csr_misa = 0xf10;
 		LOG_WARNING("Failed to read misa at 0x%x; trying 0x%x.", CSR_MISA,
 				old_csr_misa);
-		if (read_csr(target, &r->misa, old_csr_misa) != ERROR_OK) {
+		if (read_csr(target, &r->misa[0], old_csr_misa) != ERROR_OK) {
 			/* Maybe this is an old core that still has $misa at the old
 			 * address. */
 			LOG_ERROR("Failed to read misa at 0x%x.", old_csr_misa);
@@ -1598,7 +1591,7 @@ static int examine(struct target *target)
 	for (size_t i = 0; i < 32; ++i)
 		reg_cache_set(target, i, -1);
 	LOG_INFO("Examined RISCV core; XLEN=%d, misa=0x%" PRIx64,
-			riscv_xlen(target), r->misa);
+			riscv_xlen(target), r->misa[0]);
 
 	return ERROR_OK;
 }
@@ -1675,7 +1668,7 @@ static riscv_error_t handle_halt_routine(struct target *target)
 				break;
 			default:
 				LOG_ERROR("Got invalid bus access status: %d", status);
-				return ERROR_FAIL;
+				goto error;
 		}
 		if (data & DMCONTROL_INTERRUPT) {
 			interrupt_set++;
@@ -1787,6 +1780,8 @@ static riscv_error_t handle_halt_routine(struct target *target)
 					break;
 				default:
 					assert(0);
+					LOG_ERROR("Got invalid register result %d", result);
+					goto error;
 			}
 			if (riscv_xlen(target) == 32) {
 				reg_cache_set(target, reg, data & 0xffffffff);
@@ -1803,6 +1798,8 @@ static riscv_error_t handle_halt_routine(struct target *target)
 		}
 	}
 
+	scans_delete(scans);
+
 	if (dbus_busy) {
 		increase_dbus_busy_delay(target);
 		return RE_AGAIN;
@@ -1815,8 +1812,6 @@ static riscv_error_t handle_halt_routine(struct target *target)
 	/* TODO: get rid of those 2 variables and talk to the cache directly. */
 	info->dpc = reg_cache_get(target, CSR_DPC);
 	info->dcsr = reg_cache_get(target, CSR_DCSR);
-
-	scans_delete(scans);
 
 	cache_invalidate(target);
 
@@ -1847,10 +1842,7 @@ static int handle_halt(struct target *target, bool announce)
 			target->debug_reason = DBG_REASON_BREAKPOINT;
 			break;
 		case DCSR_CAUSE_HWBP:
-			target->debug_reason = DBG_REASON_WPTANDBKPT;
-			/* If we halted because of a data trigger, gdb doesn't know to do
-			 * the disable-breakpoints-step-enable-breakpoints dance. */
-			info->need_strict_step = true;
+			target->debug_reason = DBG_REASON_WATCHPOINT;
 			break;
 		case DCSR_CAUSE_DEBUGINT:
 			target->debug_reason = DBG_REASON_DBGRQ;
@@ -1871,6 +1863,12 @@ static int handle_halt(struct target *target, bool announce)
 		if (result != ERROR_OK)
 			return result;
 		riscv_enumerate_triggers(target);
+	}
+
+	if (target->debug_reason == DBG_REASON_BREAKPOINT) {
+		int retval;
+		if (riscv_semihosting(target, &retval) != 0)
+			return retval;
 	}
 
 	if (announce)
@@ -1929,26 +1927,10 @@ static int riscv011_poll(struct target *target)
 static int riscv011_resume(struct target *target, int current,
 		target_addr_t address, int handle_breakpoints, int debug_execution)
 {
-	riscv011_info_t *info = get_info(target);
-
+	RISCV_INFO(r);
 	jtag_add_ir_scan(target->tap, &select_dbus, TAP_IDLE);
 
-	if (!current) {
-		if (riscv_xlen(target) > 32) {
-			LOG_WARNING("Asked to resume at 32-bit PC on %d-bit target.",
-					riscv_xlen(target));
-		}
-		int result = register_write(target, GDB_REGNO_PC, address);
-		if (result != ERROR_OK)
-			return result;
-	}
-
-	if (info->need_strict_step || handle_breakpoints) {
-		int result = strict_step(target, false);
-		if (result != ERROR_OK)
-			return result;
-	}
-
+	r->prepped = false;
 	return resume(target, debug_execution, false);
 }
 
@@ -1967,8 +1949,11 @@ static int assert_reset(struct target *target)
 
 	/* Not sure what we should do when there are multiple cores.
 	 * Here just reset the single hart we're talking to. */
-	info->dcsr |= DCSR_EBREAKM | DCSR_EBREAKH | DCSR_EBREAKS |
-		DCSR_EBREAKU | DCSR_HALT;
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKM, riscv_ebreakm);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKS, riscv_ebreaks);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKU, riscv_ebreaku);
+	info->dcsr = set_field(info->dcsr, DCSR_EBREAKH, 1);
+	info->dcsr |= DCSR_HALT;
 	if (target->reset_halt)
 		info->dcsr |= DCSR_NDRESET;
 	else

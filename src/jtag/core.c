@@ -836,68 +836,7 @@ int default_interface_jtag_execute_queue(void)
 		return ERROR_FAIL;
 	}
 
-	int result = jtag->execute_queue();
-
-	struct jtag_command *cmd = jtag_command_queue;
-	while (debug_level >= LOG_LVL_DEBUG && cmd) {
-		switch (cmd->type) {
-			case JTAG_SCAN:
-				DEBUG_JTAG_IO("JTAG %s SCAN to %s",
-						cmd->cmd.scan->ir_scan ? "IR" : "DR",
-						tap_state_name(cmd->cmd.scan->end_state));
-				for (int i = 0; i < cmd->cmd.scan->num_fields; i++) {
-					struct scan_field *field = cmd->cmd.scan->fields + i;
-					if (field->out_value) {
-						char *str = buf_to_str(field->out_value, field->num_bits, 16);
-						DEBUG_JTAG_IO("  %db out: %s", field->num_bits, str);
-						free(str);
-					}
-					if (field->in_value) {
-						char *str = buf_to_str(field->in_value, field->num_bits, 16);
-						DEBUG_JTAG_IO("  %db  in: %s", field->num_bits, str);
-						free(str);
-					}
-				}
-				break;
-			case JTAG_TLR_RESET:
-				DEBUG_JTAG_IO("JTAG TLR RESET to %s",
-						tap_state_name(cmd->cmd.statemove->end_state));
-				break;
-			case JTAG_RUNTEST:
-				DEBUG_JTAG_IO("JTAG RUNTEST %d cycles to %s",
-						cmd->cmd.runtest->num_cycles,
-						tap_state_name(cmd->cmd.runtest->end_state));
-				break;
-			case JTAG_RESET:
-				{
-					const char *reset_str[3] = {
-						"leave", "deassert", "assert"
-					};
-					DEBUG_JTAG_IO("JTAG RESET %s TRST, %s SRST",
-							reset_str[cmd->cmd.reset->trst + 1],
-							reset_str[cmd->cmd.reset->srst + 1]);
-				}
-				break;
-			case JTAG_PATHMOVE:
-				DEBUG_JTAG_IO("JTAG PATHMOVE (TODO)");
-				break;
-			case JTAG_SLEEP:
-				DEBUG_JTAG_IO("JTAG SLEEP (TODO)");
-				break;
-			case JTAG_STABLECLOCKS:
-				DEBUG_JTAG_IO("JTAG STABLECLOCKS (TODO)");
-				break;
-			case JTAG_TMS:
-				DEBUG_JTAG_IO("JTAG STABLECLOCKS (TODO)");
-				break;
-			default:
-				LOG_ERROR("Unknown JTAG command: %d", cmd->type);
-				break;
-		}
-		cmd = cmd->next;
-	}
-
-	return result;
+	return jtag->execute_queue();
 }
 
 void jtag_execute_queue_noclear(void)
@@ -1068,7 +1007,7 @@ static bool jtag_examine_chain_match_tap(const struct jtag_tap *tap)
 		return true;
 
 	/* optionally ignore the JTAG version field - bits 28-31 of IDCODE */
-	uint32_t mask = tap->ignore_version ? ~(0xf << 28) : ~0;
+	uint32_t mask = tap->ignore_version ? ~(0xfU << 28) : ~0U;
 	uint32_t idcode = tap->idcode & mask;
 
 	/* Loop over the expected identification codes and test for a match */
@@ -1168,8 +1107,7 @@ static int jtag_examine_chain(void)
 
 		if ((idcode & 1) == 0) {
 			/* Zero for LSB indicates a device in bypass */
-			LOG_INFO("TAP %s does not have valid IDCODE (idcode=0x%x)",
-					tap->dotted_name, idcode);
+			LOG_INFO("TAP %s has invalid IDCODE (0x%x)", tap->dotted_name, idcode);
 			tap->hasidcode = false;
 			tap->idcode = 0;
 
@@ -1370,6 +1308,14 @@ void jtag_tap_free(struct jtag_tap *tap)
 {
 	jtag_unregister_event_callback(&jtag_reset_callback, tap);
 
+	struct jtag_tap_event_action *jteap = tap->event_action;
+	while (jteap) {
+		struct jtag_tap_event_action *next = jteap->next;
+		Jim_DecrRefCount(jteap->interp, jteap->body);
+		free(jteap);
+		jteap = next;
+	}
+
 	free(tap->expected);
 	free(tap->expected_mask);
 	free(tap->expected_ids);
@@ -1401,19 +1347,6 @@ int adapter_init(struct command_context *cmd_ctx)
 	if (retval != ERROR_OK)
 		return retval;
 	jtag = jtag_interface;
-
-	/* LEGACY SUPPORT ... adapter drivers  must declare what
-	 * transports they allow.  Until they all do so, assume
-	 * the legacy drivers are JTAG-only
-	 */
-	if (!transports_are_declared()) {
-		LOG_ERROR("Adapter driver '%s' did not declare "
-			"which transports it allows; assuming "
-			"JTAG-only", jtag->name);
-		retval = allow_transports(cmd_ctx, jtag_only);
-		if (retval != ERROR_OK)
-			return retval;
-	}
 
 	if (jtag->speed == NULL) {
 		LOG_INFO("This adapter doesn't support configurable speed");
@@ -1534,13 +1467,19 @@ int jtag_init_inner(struct command_context *cmd_ctx)
 
 int adapter_quit(void)
 {
-	if (!jtag || !jtag->quit)
-		return ERROR_OK;
+	if (jtag && jtag->quit) {
+		/* close the JTAG interface */
+		int result = jtag->quit();
+		if (ERROR_OK != result)
+			LOG_ERROR("failed: %d", result);
+	}
 
-	/* close the JTAG interface */
-	int result = jtag->quit();
-	if (ERROR_OK != result)
-		LOG_ERROR("failed: %d", result);
+	struct jtag_tap *t = jtag_all_taps();
+	while (t) {
+		struct jtag_tap *n = t->next_tap;
+		jtag_tap_free(t);
+		t = n;
+	}
 
 	return ERROR_OK;
 }
@@ -1659,14 +1598,18 @@ static int adapter_khz_to_speed(unsigned khz, int *speed)
 {
 	LOG_DEBUG("convert khz to interface specific speed value");
 	speed_khz = khz;
-	if (jtag != NULL) {
-		LOG_DEBUG("have interface set up");
-		int speed_div1;
-		int retval = jtag->khz(jtag_get_speed_khz(), &speed_div1);
-		if (ERROR_OK != retval)
-			return retval;
-		*speed = speed_div1;
+	if (!jtag)
+		return ERROR_OK;
+	LOG_DEBUG("have interface set up");
+	if (!jtag->khz) {
+		LOG_ERROR("Translation from khz to jtag_speed not implemented");
+		return ERROR_FAIL;
 	}
+	int speed_div1;
+	int retval = jtag->khz(jtag_get_speed_khz(), &speed_div1);
+	if (ERROR_OK != retval)
+		return retval;
+	*speed = speed_div1;
 	return ERROR_OK;
 }
 
@@ -1729,7 +1672,13 @@ int jtag_get_speed_readable(int *khz)
 	int retval = jtag_get_speed(&jtag_speed_var);
 	if (retval != ERROR_OK)
 		return retval;
-	return jtag ? jtag->speed_div(jtag_speed_var, khz) : ERROR_OK;
+	if (!jtag)
+		return ERROR_OK;
+	if (!jtag->speed_div) {
+		LOG_ERROR("Translation from jtag_speed to khz not implemented");
+		return ERROR_FAIL;
+	}
+	return jtag->speed_div(jtag_speed_var, khz);
 }
 
 void jtag_set_verify(bool enable)
@@ -1760,12 +1709,20 @@ int jtag_power_dropout(int *dropout)
 		LOG_ERROR("No Valid JTAG Interface Configured.");
 		exit(-1);
 	}
-	return jtag->power_dropout(dropout);
+	if (jtag->power_dropout)
+		return jtag->power_dropout(dropout);
+
+	*dropout = 0; /* by default we can't detect power dropout */
+	return ERROR_OK;
 }
 
 int jtag_srst_asserted(int *srst_asserted)
 {
-	return jtag->srst_asserted(srst_asserted);
+	if (jtag->srst_asserted)
+		return jtag->srst_asserted(srst_asserted);
+
+	*srst_asserted = 0; /* by default we can't detect srst asserted */
+	return ERROR_OK;
 }
 
 enum reset_types jtag_get_reset_config(void)
@@ -1891,7 +1848,7 @@ void adapter_deassert_reset(void)
 		LOG_ERROR("transport is not selected");
 }
 
-int adapter_config_trace(bool enabled, enum tpio_pin_protocol pin_protocol,
+int adapter_config_trace(bool enabled, enum tpiu_pin_protocol pin_protocol,
 			 uint32_t port_size, unsigned int *trace_freq)
 {
 	if (jtag->config_trace)

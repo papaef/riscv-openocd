@@ -53,11 +53,11 @@
  *
  * This code uses information contained in the MPSSE specification which was
  * found here:
- * http://www.ftdichip.com/Documents/AppNotes/AN2232C-01_MPSSE_Cmnd.pdf
+ * https://www.ftdichip.com/Support/Documents/AppNotes/AN2232C-01_MPSSE_Cmnd.pdf
  * Hereafter this is called the "MPSSE Spec".
  *
- * The datasheet for the ftdichip.com's FT2232D part is here:
- * http://www.ftdichip.com/Documents/DataSheets/DS_FT2232D.pdf
+ * The datasheet for the ftdichip.com's FT2232H part is here:
+ * https://www.ftdichip.com/Support/Documents/DataSheets/ICs/DS_FT2232H.pdf
  *
  * Also note the issue with code 0x4b (clock data to TMS) noted in
  * http://developer.intra2net.com/mailarchive/html/libftdi/2009/msg00292.html
@@ -69,10 +69,12 @@
 #endif
 
 /* project specific includes */
+#include <jtag/drivers/jtag_usb_common.h>
 #include <jtag/interface.h>
 #include <jtag/swd.h>
 #include <transport/transport.h>
 #include <helper/time_support.h>
+#include <helper/log.h>
 
 #if IS_CYGWIN == 1
 #include <windows.h>
@@ -83,17 +85,51 @@
 /* FTDI access library includes */
 #include "mpsse.h"
 
+#if BUILD_FTDI_OSCAN1 == 1
+#define DO_CLOCK_DATA clock_data
+#define DO_CLOCK_TMS_CS clock_tms_cs
+#define DO_CLOCK_TMS_CS_OUT clock_tms_cs_out
+#else
+#define DO_CLOCK_DATA mpsse_clock_data
+#define DO_CLOCK_TMS_CS mpsse_clock_tms_cs
+#define DO_CLOCK_TMS_CS_OUT mpsse_clock_tms_cs_out
+#endif
+
 #define JTAG_MODE (LSB_FIRST | POS_EDGE_IN | NEG_EDGE_OUT)
 #define JTAG_MODE_ALT (LSB_FIRST | NEG_EDGE_IN | NEG_EDGE_OUT)
 #define SWD_MODE (LSB_FIRST | POS_EDGE_IN | NEG_EDGE_OUT)
 
 static char *ftdi_device_desc;
 static char *ftdi_serial;
-static char *ftdi_location;
 static uint8_t ftdi_channel;
 static uint8_t ftdi_jtag_mode = JTAG_MODE;
 
 static bool swd_mode;
+
+#if BUILD_FTDI_OSCAN1 == 1
+/*
+  The cJTAG 2-wire OSCAN1 protocol, in lieu of 4-wire JTAG, is a configuration option
+  for some SoCs. An FTDI-based adapter that can be configured to appropriately drive
+  the bidirectional pin TMSC is able to drive OSCAN1 protocol.  For example, an Olimex
+  ARM-USB-TINY-H with the ARM-JTAG-SWD adapter, connected to a cJTAG-enabled
+  target board is such a topology.  A TCK cycle with TMS=1/TDI=N translates to a TMSC
+  output of N, and a TCK cycle with TMS=0 translates to a TMSC input from the target back
+  to the adapter/probe.  The OSCAN1 protocol uses 3 TCK cycles to generate the data flow
+  that is equivalent to that of a single TCK cycle in 4-wire JTAG. The OSCAN1-related
+  code in this module translates IR/DR scan commanads and JTAG state traversal commands
+  to the two-wire clocking and signaling of OSCAN1 protocol, if placed into oscan1 mode
+  during initialization.
+*/
+static void oscan1_reset_online_activate(void);
+static void oscan1_mpsse_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+				    unsigned in_offset, unsigned length, uint8_t mode);
+static void oscan1_mpsse_clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+				      unsigned in_offset, unsigned length, bool tdi, uint8_t mode);
+static void oscan1_mpsse_clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+					  unsigned length, bool tdi, uint8_t mode);
+
+static bool oscan1_mode;
+#endif
 
 #define MAX_USB_IDS 8
 /* vid = pid = 0 marks the end of the list */
@@ -240,6 +276,35 @@ static int ftdi_get_signal(const struct signal *s, uint16_t * value_out)
 	return ERROR_OK;
 }
 
+#if BUILD_FTDI_OSCAN1 == 1
+static void clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+		     unsigned in_offset, unsigned length, uint8_t mode)
+{
+	if (oscan1_mode)
+		oscan1_mpsse_clock_data(ctx, out, out_offset, in, in_offset, length, mode);
+	else
+		mpsse_clock_data(ctx, out, out_offset, in, in_offset, length, mode);
+}
+
+static void clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+		       unsigned in_offset, unsigned length, bool tdi, uint8_t mode)
+{
+	if (oscan1_mode)
+		oscan1_mpsse_clock_tms_cs(ctx, out, out_offset, in, in_offset, length, tdi, mode);
+	else
+		mpsse_clock_tms_cs(ctx, out, out_offset, in, in_offset, length, tdi, mode);
+}
+
+static void clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+			   unsigned length, bool tdi, uint8_t mode)
+{
+	if (oscan1_mode)
+		oscan1_mpsse_clock_tms_cs_out(ctx, out, out_offset, length, tdi, mode);
+	else
+		mpsse_clock_tms_cs_out(ctx, out, out_offset, length, tdi, mode);
+}
+#endif
+
 /**
  * Function move_to_state
  * moves the TAP controller from the current state to a
@@ -262,13 +327,13 @@ static void move_to_state(tap_state_t goal_state)
 	int tms_count = tap_get_tms_path_len(start_state, goal_state);
 	assert(tms_count <= 8);
 
-	DEBUG_JTAG_IO("start=%s goal=%s", tap_state_name(start_state), tap_state_name(goal_state));
+	LOG_DEBUG_IO("start=%s goal=%s", tap_state_name(start_state), tap_state_name(goal_state));
 
 	/* Track state transitions step by step */
 	for (int i = 0; i < tms_count; i++)
 		tap_set_state(tap_state_transition(tap_get_state(), (tms_bits >> i) & 1));
 
-	mpsse_clock_tms_cs_out(mpsse_ctx,
+	DO_CLOCK_TMS_CS_OUT(mpsse_ctx,
 		&tms_bits,
 		0,
 		tms_count,
@@ -322,9 +387,9 @@ static void ftdi_end_state(tap_state_t state)
 static void ftdi_execute_runtest(struct jtag_command *cmd)
 {
 	int i;
-	uint8_t zero = 0;
+	static const uint8_t zero;
 
-	DEBUG_JTAG_IO("runtest %i cycles, end in %s",
+	LOG_DEBUG_IO("runtest %i cycles, end in %s",
 		cmd->cmd.runtest->num_cycles,
 		tap_state_name(cmd->cmd.runtest->end_state));
 
@@ -336,7 +401,7 @@ static void ftdi_execute_runtest(struct jtag_command *cmd)
 	while (i > 0) {
 		/* there are no state transitions in this code, so omit state tracking */
 		unsigned this_len = i > 7 ? 7 : i;
-		mpsse_clock_tms_cs_out(mpsse_ctx, &zero, 0, this_len, false, ftdi_jtag_mode);
+		DO_CLOCK_TMS_CS_OUT(mpsse_ctx, &zero, 0, this_len, false, ftdi_jtag_mode);
 		i -= this_len;
 	}
 
@@ -345,14 +410,14 @@ static void ftdi_execute_runtest(struct jtag_command *cmd)
 	if (tap_get_state() != tap_get_end_state())
 		move_to_state(tap_get_end_state());
 
-	DEBUG_JTAG_IO("runtest: %i, end in %s",
+	LOG_DEBUG_IO("runtest: %i, end in %s",
 		cmd->cmd.runtest->num_cycles,
 		tap_state_name(tap_get_end_state()));
 }
 
 static void ftdi_execute_statemove(struct jtag_command *cmd)
 {
-	DEBUG_JTAG_IO("statemove end in %s",
+	LOG_DEBUG_IO("statemove end in %s",
 		tap_state_name(cmd->cmd.statemove->end_state));
 
 	ftdi_end_state(cmd->cmd.statemove->end_state);
@@ -368,10 +433,10 @@ static void ftdi_execute_statemove(struct jtag_command *cmd)
  */
 static void ftdi_execute_tms(struct jtag_command *cmd)
 {
-	DEBUG_JTAG_IO("TMS: %d bits", cmd->cmd.tms->num_bits);
+	LOG_DEBUG_IO("TMS: %d bits", cmd->cmd.tms->num_bits);
 
 	/* TODO: Missing tap state tracking, also missing from ft2232.c! */
-	mpsse_clock_tms_cs_out(mpsse_ctx,
+	DO_CLOCK_TMS_CS_OUT(mpsse_ctx,
 		cmd->cmd.tms->bits,
 		0,
 		cmd->cmd.tms->num_bits,
@@ -384,7 +449,7 @@ static void ftdi_execute_pathmove(struct jtag_command *cmd)
 	tap_state_t *path = cmd->cmd.pathmove->path;
 	int num_states  = cmd->cmd.pathmove->num_states;
 
-	DEBUG_JTAG_IO("pathmove: %i states, current: %s  end: %s", num_states,
+	LOG_DEBUG_IO("pathmove: %i states, current: %s  end: %s", num_states,
 		tap_state_name(tap_get_state()),
 		tap_state_name(path[num_states-1]));
 
@@ -392,7 +457,7 @@ static void ftdi_execute_pathmove(struct jtag_command *cmd)
 	unsigned bit_count = 0;
 	uint8_t tms_byte = 0;
 
-	DEBUG_JTAG_IO("-");
+	LOG_DEBUG_IO("-");
 
 	/* this loop verifies that the path is legal and logs each state in the path */
 	while (num_states--) {
@@ -418,7 +483,7 @@ static void ftdi_execute_pathmove(struct jtag_command *cmd)
 		state_count++;
 
 		if (bit_count == 7 || num_states == 0) {
-			mpsse_clock_tms_cs_out(mpsse_ctx,
+			DO_CLOCK_TMS_CS_OUT(mpsse_ctx,
 					&tms_byte,
 					0,
 					bit_count,
@@ -432,18 +497,18 @@ static void ftdi_execute_pathmove(struct jtag_command *cmd)
 
 static void ftdi_execute_scan(struct jtag_command *cmd)
 {
-	DEBUG_JTAG_IO("%s type:%d", cmd->cmd.scan->ir_scan ? "IRSCAN" : "DRSCAN",
+	LOG_DEBUG_IO("%s type:%d", cmd->cmd.scan->ir_scan ? "IRSCAN" : "DRSCAN",
 		jtag_scan_type(cmd->cmd.scan));
 
 	/* Make sure there are no trailing fields with num_bits == 0, or the logic below will fail. */
 	while (cmd->cmd.scan->num_fields > 0
 			&& cmd->cmd.scan->fields[cmd->cmd.scan->num_fields - 1].num_bits == 0) {
 		cmd->cmd.scan->num_fields--;
-		LOG_DEBUG("discarding trailing empty field");
+		LOG_DEBUG_IO("discarding trailing empty field");
 	}
 
 	if (cmd->cmd.scan->num_fields == 0) {
-		LOG_DEBUG("empty scan, doing nothing");
+		LOG_DEBUG_IO("empty scan, doing nothing");
 		return;
 	}
 
@@ -462,7 +527,7 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 
 	for (int i = 0; i < cmd->cmd.scan->num_fields; i++, field++) {
 		scan_size += field->num_bits;
-		DEBUG_JTAG_IO("%s%s field %d/%d %d bits",
+		LOG_DEBUG_IO("%s%s field %d/%d %d bits",
 			field->in_value ? "in" : "",
 			field->out_value ? "out" : "",
 			i,
@@ -472,7 +537,7 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 		if (i == cmd->cmd.scan->num_fields - 1 && tap_get_state() != tap_get_end_state()) {
 			/* Last field, and we're leaving IRSHIFT/DRSHIFT. Clock last bit during tap
 			 * movement. This last field can't have length zero, it was checked above. */
-			mpsse_clock_data(mpsse_ctx,
+			DO_CLOCK_DATA(mpsse_ctx,
 				field->out_value,
 				0,
 				field->in_value,
@@ -483,7 +548,7 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 			if (field->out_value)
 				bit_copy(&last_bit, 0, field->out_value, field->num_bits - 1, 1);
 			uint8_t tms_bits = 0x01;
-			mpsse_clock_tms_cs(mpsse_ctx,
+			DO_CLOCK_TMS_CS(mpsse_ctx,
 					&tms_bits,
 					0,
 					field->in_value,
@@ -492,7 +557,7 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 					last_bit,
 					ftdi_jtag_mode);
 			tap_set_state(tap_state_transition(tap_get_state(), 1));
-			mpsse_clock_tms_cs_out(mpsse_ctx,
+			DO_CLOCK_TMS_CS_OUT(mpsse_ctx,
 					&tms_bits,
 					1,
 					1,
@@ -500,7 +565,7 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 					ftdi_jtag_mode);
 			tap_set_state(tap_state_transition(tap_get_state(), 0));
 		} else
-			mpsse_clock_data(mpsse_ctx,
+			DO_CLOCK_DATA(mpsse_ctx,
 				field->out_value,
 				0,
 				field->in_value,
@@ -512,14 +577,14 @@ static void ftdi_execute_scan(struct jtag_command *cmd)
 	if (tap_get_state() != tap_get_end_state())
 		move_to_state(tap_get_end_state());
 
-	DEBUG_JTAG_IO("%s scan, %i bits, end in %s",
+	LOG_DEBUG_IO("%s scan, %i bits, end in %s",
 		(cmd->cmd.scan->ir_scan) ? "IR" : "DR", scan_size,
 		tap_state_name(tap_get_end_state()));
 }
 
 static void ftdi_execute_reset(struct jtag_command *cmd)
 {
-	DEBUG_JTAG_IO("reset trst: %i srst %i",
+	LOG_DEBUG_IO("reset trst: %i srst %i",
 		cmd->cmd.reset->trst, cmd->cmd.reset->srst);
 
 	if (cmd->cmd.reset->trst == 1
@@ -555,17 +620,17 @@ static void ftdi_execute_reset(struct jtag_command *cmd)
 			ftdi_set_signal(srst, 'z');
 	}
 
-	DEBUG_JTAG_IO("trst: %i, srst: %i",
+	LOG_DEBUG_IO("trst: %i, srst: %i",
 		cmd->cmd.reset->trst, cmd->cmd.reset->srst);
 }
 
 static void ftdi_execute_sleep(struct jtag_command *cmd)
 {
-	DEBUG_JTAG_IO("sleep %" PRIi32, cmd->cmd.sleep->us);
+	LOG_DEBUG_IO("sleep %" PRIi32, cmd->cmd.sleep->us);
 
 	mpsse_flush(mpsse_ctx);
 	jtag_sleep(cmd->cmd.sleep->us);
-	DEBUG_JTAG_IO("sleep %" PRIi32 " usec while in %s",
+	LOG_DEBUG_IO("sleep %" PRIi32 " usec while in %s",
 		cmd->cmd.sleep->us,
 		tap_state_name(tap_get_state()));
 }
@@ -585,11 +650,11 @@ static void ftdi_execute_stableclocks(struct jtag_command *cmd)
 	while (num_cycles > 0) {
 		/* there are no state transitions in this code, so omit state tracking */
 		unsigned this_len = num_cycles > 7 ? 7 : num_cycles;
-		mpsse_clock_tms_cs_out(mpsse_ctx, &tms, 0, this_len, false, ftdi_jtag_mode);
+		DO_CLOCK_TMS_CS_OUT(mpsse_ctx, &tms, 0, this_len, false, ftdi_jtag_mode);
 		num_cycles -= this_len;
 	}
 
-	DEBUG_JTAG_IO("clocks %i while in %s",
+	LOG_DEBUG_IO("clocks %i while in %s",
 		cmd->cmd.stableclocks->num_cycles,
 		tap_state_name(tap_get_state()));
 }
@@ -599,12 +664,18 @@ static void ftdi_execute_command(struct jtag_command *cmd)
 	switch (cmd->type) {
 		case JTAG_RESET:
 			ftdi_execute_reset(cmd);
+#if BUILD_FTDI_OSCAN1 == 1
+			oscan1_reset_online_activate(); /* put the target back into OSCAN1 mode */
+#endif
 			break;
 		case JTAG_RUNTEST:
 			ftdi_execute_runtest(cmd);
 			break;
 		case JTAG_TLR_RESET:
 			ftdi_execute_statemove(cmd);
+#if BUILD_FTDI_OSCAN1 == 1
+			oscan1_reset_online_activate(); /* put the target back into OSCAN1 mode */
+#endif
 			break;
 		case JTAG_PATHMOVE:
 			ftdi_execute_pathmove(cmd);
@@ -658,7 +729,7 @@ static int ftdi_initialize(void)
 
 	for (int i = 0; ftdi_vid[i] || ftdi_pid[i]; i++) {
 		mpsse_ctx = mpsse_open(&ftdi_vid[i], &ftdi_pid[i], ftdi_device_desc,
-				ftdi_serial, ftdi_location, ftdi_channel);
+				ftdi_serial, jtag_usb_get_location(), ftdi_channel);
 		if (mpsse_ctx)
 			break;
 	}
@@ -678,6 +749,17 @@ static int ftdi_initialize(void)
 		/* A dummy SWD_EN would have zero mask */
 		if (sig->data_mask)
 			ftdi_set_signal(sig, '1');
+#if BUILD_FTDI_OSCAN1 == 1
+	} else if (oscan1_mode) {
+		struct signal *sig = find_signal_by_name("JTAG_SEL");
+		if (!sig) {
+			LOG_ERROR("OSCAN1 mode is active but JTAG_SEL signal is not defined");
+			return ERROR_JTAG_INIT_FAILED;
+		}
+		/* A dummy JTAG_SEL would have zero mask */
+		if (sig->data_mask)
+			ftdi_set_signal(sig, '0');
+#endif
 	}
 
 	mpsse_set_data_bits_low_byte(mpsse_ctx, output & 0xff, direction & 0xff);
@@ -694,10 +776,269 @@ static int ftdi_quit(void)
 {
 	mpsse_close(mpsse_ctx);
 
+	struct signal *sig = signals;
+	while (sig) {
+		struct signal *next = sig->next;
+		free((void *)sig->name);
+		free(sig);
+		sig = next;
+	}
+
+	free(ftdi_device_desc);
+	free(ftdi_serial);
+
 	free(swd_cmd_queue);
 
 	return ERROR_OK;
 }
+
+#if BUILD_FTDI_OSCAN1 == 1
+static void oscan1_mpsse_clock_data(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+		     unsigned in_offset, unsigned length, uint8_t mode)
+{
+	static const uint8_t zero;
+	static const uint8_t one = 1;
+
+	LOG_DEBUG_IO("oscan1_mpsse_clock_data: %sout %d bits", in ? "in" : "", length);
+
+	for (unsigned i = 0; i < length; i++) {
+		int bitnum;
+		uint8_t bit;
+
+		/* OSCAN1 uses 3 separate clocks */
+
+		/* drive TMSC to the *negation* of the desired TDI value */
+		bitnum = out_offset + i;
+		bit = out ? ((out[bitnum/8] >> (bitnum%8)) & 0x1) : 0;
+
+		/* Try optimized case first: if desired TDI bit is 1, then we
+		   can fuse what would otherwise be the first two MPSSE commands */
+		if (bit) {
+			const uint8_t tmsbits = 0x3;  /* 1, 1 */
+			mpsse_clock_tms_cs_out(mpsse_ctx, &tmsbits, 0, 2, false, mode);
+		} else {
+			/* Can't fuse because TDI varies; less efficient */
+			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, bit ? 0 : 1, mode);
+
+			/* drive TMSC to desired TMS value (always zero in this context) */
+			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, false, mode);
+		}
+
+		/* drive another TCK without driving TMSC (TDO cycle) */
+		mpsse_clock_tms_cs(mpsse_ctx, &zero, 0, in, in_offset+i, 1, false, mode);
+	}
+}
+
+
+static void oscan1_mpsse_clock_tms_cs(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset, uint8_t *in,
+		       unsigned in_offset, unsigned length, bool tdi, uint8_t mode)
+{
+	static const uint8_t zero;
+	static const uint8_t one = 1;
+
+	LOG_DEBUG_IO("oscan1_mpsse_clock_tms_cs: %sout %d bits, tdi=%d", in ? "in" : "", length, tdi);
+
+	for (unsigned i = 0; i < length; i++) {
+		int bitnum;
+		uint8_t tmsbit;
+		uint8_t tdibit;
+
+		/* OSCAN1 uses 3 separate clocks */
+
+		/* drive TMSC to the *negation* of the desired TDI value */
+		tdibit = tdi ? 0 : 1;
+
+		/* drive TMSC to desired TMS value */
+		bitnum = out_offset + i;
+		tmsbit = ((out[bitnum/8] >> (bitnum%8)) & 0x1);
+
+		if (tdibit == tmsbit) {
+			/* Can squash into a single MPSSE command */
+			const uint8_t tmsbits = 0x3;
+			mpsse_clock_tms_cs_out(mpsse_ctx, &tmsbits, 0, 2, tdibit, mode);
+		} else {
+			/* Unoptimized case, can't formulate with a single command */
+			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, tdibit, mode);
+			mpsse_clock_tms_cs_out(mpsse_ctx, &one, 0, 1, (tmsbit != 0), mode);
+		}
+
+		/* drive another TCK without driving TMSC (TDO cycle) */
+		mpsse_clock_tms_cs(mpsse_ctx, &zero, 0, in, in_offset+i, 1, false, mode);
+	}
+}
+
+
+static void oscan1_mpsse_clock_tms_cs_out(struct mpsse_ctx *ctx, const uint8_t *out, unsigned out_offset,
+			   unsigned length, bool tdi, uint8_t mode)
+{
+	oscan1_mpsse_clock_tms_cs(ctx, out, out_offset, 0, 0, length, tdi, mode);
+}
+
+
+static void oscan1_set_tck_tms_tdi(struct signal *tck, char tckvalue, struct signal *tms,
+				   char tmsvalue, struct signal *tdi, char tdivalue)
+{
+	ftdi_set_signal(tms, tmsvalue);
+	ftdi_set_signal(tdi, tdivalue);
+	ftdi_set_signal(tck, tckvalue);
+}
+
+static void oscan1_reset_online_activate(void)
+{
+	/* After TAP reset, the OSCAN1-to-JTAG adapter is in offline and
+	non-activated state.  Escape sequences are needed to bring
+	the TAP online and activated into OSCAN1 mode. */
+
+	struct signal *tck = find_signal_by_name("TCK");
+	struct signal *tdi = find_signal_by_name("TDI");
+	struct signal *tms = find_signal_by_name("TMS");
+	struct signal *tdo = find_signal_by_name("TDO");
+	uint16_t tdovalue;
+
+	static const struct {
+	  int8_t tck;
+	  int8_t tms;
+	  int8_t tdi;
+	} sequence[] = {
+	  /* TCK=0, TMS=1, TDI=0 (drive TMSC to 0 baseline) */
+	  {'0', '1', '0'},
+
+	  /* Drive cJTAG escape sequence for TAP reset - 8 TMSC edges */
+	  /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
+	  {'0', '1', '0'},
+
+	  /* 3 TCK pulses for padding */
+	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (drive rising TCK edge) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (drive falling TCK edge) */
+	  {'0', '1', '0'},
+
+	  /* Drive cJTAG escape sequence for SELECT */
+	  /* TCK=1, TMS=1, TDI=0 (rising edge of TCK with TMSC still 0, TAP reset that was just setup occurs here too) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=1 (drive rising TMSC edge) */
+	  {'1', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=0 (drive falling TMSC edge) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK with TMSC still 0) */
+	  {'0', '1', '0'},
+
+	  /* Drive cJTAG escape sequence for activation */
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK with TMSC still 0... online mode activated... also OAC bit0==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... OAC bit1==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
+	  {'0', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit2==1) */
+	  {'1', '1', '1'},
+	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK, TMSC stays high) */
+	  {'0', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... OAC bit3==1) */
+	  {'1', '1', '1'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit0==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit1==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... EC bit2==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=1 (falling edge TCK) */
+	  {'0', '1', '1'},
+	  /* TCK=1, TMS=1, TDI=1 (rising edge TCK... EC bit3==1) */
+	  {'1', '1', '1'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit0==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit1==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit2==0) */
+	  {'1', '1', '0'},
+	  /* TCK=0, TMS=1, TDI=0 (falling edge TCK) */
+	  {'0', '1', '0'},
+	  /* TCK=1, TMS=1, TDI=0 (rising edge TCK... CP bit3==0) */
+	  {'1', '1', '0'},
+	};
+
+
+	if (!oscan1_mode)
+		return;
+
+
+	if (!tck) {
+		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TCK signal is not defined");
+		return;
+	}
+
+	if (!tdi) {
+		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDI signal is not defined");
+		return;
+	}
+
+	if (!tms) {
+		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TMS signal is not defined");
+		return;
+	}
+
+	if (!tdo) {
+		LOG_ERROR("Can't run cJTAG online/activate escape sequences: TDO signal is not defined");
+		return;
+	}
+
+	/* Send the sequence to the adapter */
+	for (size_t i = 0; i < sizeof(sequence)/sizeof(sequence[0]); i++)
+		oscan1_set_tck_tms_tdi(tck, sequence[i].tck, tms, sequence[i].tms, tdi, sequence[i].tdi);
+
+	ftdi_get_signal(tdo, &tdovalue);  /* Just to force a flush */
+}
+
+#endif /* #if BUILD_FTDI_OSCAN1 == 1 */
 
 COMMAND_HANDLER(ftdi_handle_device_desc_command)
 {
@@ -724,21 +1065,6 @@ COMMAND_HANDLER(ftdi_handle_serial_command)
 
 	return ERROR_OK;
 }
-
-#ifdef HAVE_LIBUSB_GET_PORT_NUMBERS
-COMMAND_HANDLER(ftdi_handle_location_command)
-{
-	if (CMD_ARGC == 1) {
-		if (ftdi_location)
-			free(ftdi_location);
-		ftdi_location = strdup(CMD_ARGV[0]);
-	} else {
-		return ERROR_COMMAND_SYNTAX_ERROR;
-	}
-
-	return ERROR_OK;
-}
-#endif
 
 COMMAND_HANDLER(ftdi_handle_channel_command)
 {
@@ -934,10 +1260,24 @@ COMMAND_HANDLER(ftdi_handle_tdo_sample_edge_command)
 	}
 
 	n = Jim_Nvp_value2name_simple(nvp_ftdi_jtag_modes, ftdi_jtag_mode);
-	command_print(CMD_CTX, "ftdi samples TDO on %s edge of TCK", n->name);
+	command_print(CMD, "ftdi samples TDO on %s edge of TCK", n->name);
 
 	return ERROR_OK;
 }
+
+#if BUILD_FTDI_OSCAN1 == 1
+COMMAND_HANDLER(ftdi_handle_oscan1_mode_command)
+{
+	if (CMD_ARGC > 1)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+
+	if (CMD_ARGC == 1)
+		COMMAND_PARSE_ON_OFF(CMD_ARGV[0], oscan1_mode);
+
+	command_print(CMD, "oscan1 mode: %s.", oscan1_mode ? "on" : "off");
+	return ERROR_OK;
+}
+#endif
 
 static const struct command_registration ftdi_command_handlers[] = {
 	{
@@ -954,15 +1294,6 @@ static const struct command_registration ftdi_command_handlers[] = {
 		.help = "set the serial number of the FTDI device",
 		.usage = "serial_string",
 	},
-#ifdef HAVE_LIBUSB_GET_PORT_NUMBERS
-	{
-		.name = "ftdi_location",
-		.handler = &ftdi_handle_location_command,
-		.mode = COMMAND_CONFIG,
-		.help = "set the USB bus location of the FTDI device",
-		.usage = "<bus>:port[,port]...",
-	},
-#endif
 	{
 		.name = "ftdi_channel",
 		.handler = &ftdi_handle_channel_command,
@@ -1016,6 +1347,15 @@ static const struct command_registration ftdi_command_handlers[] = {
 			"allow signalling speed increase)",
 		.usage = "(rising|falling)",
 	},
+#if BUILD_FTDI_OSCAN1 == 1
+	{
+		.name = "ftdi_oscan1_mode",
+		.handler = &ftdi_handle_oscan1_mode_command,
+		.mode = COMMAND_ANY,
+		.help = "set to 'on' to use OSCAN1 mode for signaling, otherwise 'off' (default is 'off')",
+		.usage = "(on|off)",
+	},
+#endif
 	COMMAND_REGISTRATION_DONE
 };
 
@@ -1068,7 +1408,7 @@ static void ftdi_swd_swdio_en(bool enable)
 		if (oe->data_mask)
 			ftdi_set_signal(oe, enable ? '1' : '0');
 		else {
-			/* Sets TDI/DO pin (pin 2) to input during rx when both pins are connected
+			/* Sets TDI/DO pin to input during rx when both pins are connected
 			   to SWDIO */
 			if (enable)
 				direction |= jtag_direction_init & 0x0002U;
@@ -1216,14 +1556,6 @@ static void ftdi_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_cl
 	ftdi_swd_queue_cmd(cmd, NULL, value, ap_delay_clk);
 }
 
-static int_least32_t ftdi_swd_frequency(int_least32_t hz)
-{
-	if (hz > 0)
-		freq = mpsse_set_frequency(mpsse_ctx, hz);
-
-	return freq;
-}
-
 static int ftdi_swd_switch_seq(enum swd_special_seq seq)
 {
 	switch (seq) {
@@ -1252,7 +1584,6 @@ static int ftdi_swd_switch_seq(enum swd_special_seq seq)
 
 static const struct swd_driver ftdi_swd = {
 	.init = ftdi_swd_init,
-	.frequency = ftdi_swd_frequency,
 	.switch_seq = ftdi_swd_switch_seq,
 	.read_reg = ftdi_swd_read_reg,
 	.write_reg = ftdi_swd_write_reg,

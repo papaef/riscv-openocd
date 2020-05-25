@@ -3,9 +3,11 @@
 #endif
 
 #include "riscv_debug.h"
+#include "target/register.h"
 #include "target/target.h"
 #include "target/riscv/riscv.h"
 #include "server/gdb_server.h"
+#include "helper/binarybuffer.h"
 
 static int riscv_gdb_thread_packet(struct connection *connection, const char *packet, int packet_size);
 static int riscv_gdb_v_packet(struct connection *connection, const char *packet, int packet_size);
@@ -19,14 +21,16 @@ static bool riscv_detect_rtos(struct target *target)
 static int riscv_create_rtos(struct target *target)
 {
 	LOG_DEBUG("RISC-V Debug 'RTOS' created: this doesn't mean you're running an RTOS, just that you have multi-hart support on RISC-V");
+	LOG_WARNING("`-rtos riscv` is deprecated! Please change your configuration to use `-rtos");
+	LOG_WARNING("hwthread` instead. To do that, you will have to explicitly list every hart in");
+	LOG_WARNING("the system as a separate target. See");
+	LOG_WARNING("https://github.com/riscv/riscv-tests/blob/ec6537fc4a527ca88be2f045e01c460e640ab9c5/debug/targets/SiFive/HiFiveUnleashed.cfg#L11");
+	LOG_WARNING("for an example.");
+	LOG_WARNING("You will have to change your configuration file in any OpenOCD newer than June");
+	LOG_WARNING("2020.");
 
 	struct riscv_rtos *r = calloc(1, sizeof(*r));
 	target->rtos->rtos_specific_params = r;
-#if 0
-	r->target_hartid = 0;
-	r->target_any_hart = true;
-	r->target_every_hart = true;
-#endif
 
 	target->rtos->current_threadid = 1;
 	target->rtos->current_thread = 1;
@@ -129,6 +133,18 @@ static int riscv_gdb_thread_packet(struct connection *connection, const char *pa
 			return ERROR_OK;
 		}
 
+		if (strcmp(packet, "qTStatus") == 0) {
+			gdb_put_packet(connection, "T0", 2);
+			return ERROR_OK;
+		}
+
+		if (strcmp(packet, "qC") == 0) {
+			char rep_str[32];
+			snprintf(rep_str, 32, "QC%" PRIx64, rtos->current_threadid);
+			gdb_put_packet(connection, rep_str, strlen(rep_str));
+			return ERROR_OK;
+		}
+
 		return GDB_THREAD_PACKET_NOT_CONSUMED;
 
 	case 'Q':
@@ -167,6 +183,7 @@ static int riscv_gdb_thread_packet(struct connection *connection, const char *pa
 			break;
 		default:
 			riscv_set_rtos_hartid(target, tid - 1);
+			rtos->current_threadid = tid;
 			break;
 		}
 
@@ -240,68 +257,87 @@ static int riscv_gdb_v_packet(struct connection *connection, const char *packet,
 	if (sscanf(packet_stttrr, "vCont;s:%d;c", &threadid) == 1) {
 		riscv_set_rtos_hartid(target, threadid - 1);
 		riscv_step_rtos_hart(target);
+		/* Stepping changes the current thread to whichever thread was stepped. */
+		target->rtos->current_threadid = threadid;
 
 		gdb_put_packet(connection, "S05", 3);
 		return JIM_OK;
-	}
 
-	if (strcmp(packet_stttrr, "vCont;c") == 0) {
+	} else if (strcmp(packet_stttrr, "vCont;c") == 0) {
 		target_call_event_callbacks(target, TARGET_EVENT_GDB_START);
 		target_call_event_callbacks(target, TARGET_EVENT_RESUME_START);
-		riscv_openocd_resume(target, 1, 0, 0, 0);
+		riscv_set_all_rtos_harts(target);
+		riscv_resume(target, 1, 0, 0, 0, false);
 		target->state = TARGET_RUNNING;
 		gdb_set_frontend_state_running(connection);
 		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 		target_call_event_callbacks(target, TARGET_EVENT_RESUME_END);
 		return JIM_OK;
-	}
 
-	if (strncmp(packet_stttrr, "vCont", 5) == 0)
+	} else if (strncmp(packet_stttrr, "vCont", 5) == 0) {
 		LOG_ERROR("Got unknown vCont-type packet");
+	}
 
 	return GDB_THREAD_PACKET_NOT_CONSUMED;
 }
 
-static int riscv_get_thread_reg_list(struct rtos *rtos, int64_t thread_id, char **hex_reg_list)
+static int riscv_get_thread_reg(struct rtos *rtos, int64_t thread_id,
+		uint32_t reg_num, struct rtos_reg *rtos_reg)
+{
+	LOG_DEBUG("thread_id=%" PRId64 ", reg_num=%d", thread_id, reg_num);
+
+	struct target *target = rtos->target;
+	struct reg *reg = register_get_by_number(target->reg_cache, reg_num, true);
+	if (!reg)
+		return ERROR_FAIL;
+
+	uint64_t reg_value = 0;
+	if (riscv_get_register_on_hart(rtos->target, &reg_value, thread_id - 1,
+				reg_num) != ERROR_OK)
+		return ERROR_FAIL;
+
+	buf_set_u64(rtos_reg->value, 0, 64, reg_value);
+	rtos_reg->number = reg->number;
+	rtos_reg->size = reg->size;
+	return ERROR_OK;
+}
+
+static int riscv_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
+		struct rtos_reg **reg_list, int *num_regs)
 {
 	LOG_DEBUG("Updating RISC-V register list for hart %d", (int)(thread_id - 1));
 
-#if 0
-	LOG_ERROR("  Not actually updating");
-	*hex_reg_list = 0;
-	return JIM_OK;
-#endif
+	/* We return just the GPRs here. */
 
-	size_t n_regs = 32;
-	size_t xlen = 64;
-	size_t reg_chars = xlen / 8 * 2;
+	*num_regs = 33;
+	int xlen = riscv_xlen_of_hart(rtos->target, thread_id - 1);
 
-	ssize_t hex_reg_list_length = n_regs * reg_chars + 2;
-	*hex_reg_list = malloc(hex_reg_list_length);
-	*hex_reg_list[0] = '\0';
-	char *p = hex_reg_list[0];
-	for (size_t i = 0; i < n_regs; ++i) {
-		assert(p - hex_reg_list[0] > 3);
-		if (riscv_has_register(rtos->target, thread_id, i)) {
-			uint64_t reg_value;
-			int result = riscv_get_register_on_hart(rtos->target, &reg_value,
-					thread_id - 1, i);
-			if (result != ERROR_OK)
-				return JIM_ERR;
+	*reg_list = calloc(*num_regs, sizeof(struct rtos_reg));
+	for (int i = 0; i < *num_regs; ++i) {
+		uint64_t reg_value;
+		if (riscv_get_register_on_hart(rtos->target, &reg_value, thread_id - 1,
+					i) != ERROR_OK)
+			return JIM_ERR;
 
-			for (size_t byte = 0; byte < xlen / 8; ++byte) {
-				uint8_t reg_byte = reg_value >> (byte * 8);
-				p += snprintf(p, 3, "%02x", reg_byte);
-			}
-		} else {
-			for (size_t byte = 0; byte < xlen / 8; ++byte) {
-				strcpy(p, "xx");
-				p += 2;
-			}
-		}
+		(*reg_list)[i].number = i;
+		(*reg_list)[i].size = xlen;
+		buf_set_u64((*reg_list)[i].value, 0, 64, reg_value);
 	}
-	LOG_DEBUG("%s", *hex_reg_list);
 	return JIM_OK;
+}
+
+static int riscv_set_reg(struct rtos *rtos, uint32_t reg_num,
+		uint8_t *reg_value)
+{
+	struct target *target = rtos->target;
+	struct reg *reg = register_get_by_number(target->reg_cache, reg_num, true);
+	if (!reg)
+		return ERROR_FAIL;
+
+	int hartid = rtos->current_threadid - 1;
+	uint64_t value = buf_get_u64(reg_value, 0, reg->size);
+
+	return riscv_set_register_on_hart(target, hartid, reg_num, value);
 }
 
 static int riscv_get_symbol_list_to_lookup(symbol_table_elem_t *symbol_list[])
@@ -317,6 +353,8 @@ const struct rtos_type riscv_rtos = {
 	.detect_rtos = riscv_detect_rtos,
 	.create = riscv_create_rtos,
 	.update_threads = riscv_update_threads,
+	.get_thread_reg = riscv_get_thread_reg,
 	.get_thread_reg_list = riscv_get_thread_reg_list,
 	.get_symbol_list_to_lookup = riscv_get_symbol_list_to_lookup,
+	.set_reg = riscv_set_reg,
 };
